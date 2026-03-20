@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """
-Polymarket wallet collector and rolling win-rate analyzer.
+Polymarket wallet collector and profitability analyzer.
 
 Examples:
     python polymarket_analyzer.py
-    python polymarket_analyzer.py --max_wallets 200 --period_days 180 --output_dir ./polymarket_analysis
-    python polymarket_analyzer.py --leaderboard_only
-    python polymarket_analyzer.py --use_subgraph --max_wallets 50
+    python polymarket_analyzer.py --max_wallets 500 --period_days 180 --output_dir ./polymarket_analysis
+    python polymarket_analyzer.py --max_wallets 2000 --subgraph_wallet_pages 500 --workers 0
+    python polymarket_analyzer.py --leaderboard_only --max_cpu_percent 30 --max_mem_percent 30
 
 Warning:
-    Public Polymarket endpoints are rate-limited and their parameter caps change over time.
-    This script sleeps between requests, retries transient failures, and uses the documented 2026-safe
-    pagination caps for leaderboard, trades, and closed-positions endpoints.
+    Public Polymarket and Goldsky endpoints can throttle aggressive crawlers. This script uses retries,
+    adaptive worker selection, request pacing, local response caching, market batching, and buffered writes.
+    Tune `--workers`, `--max_cpu_percent`, `--max_mem_percent`, and `--request_interval_seconds` conservatively
+    on a VPS. Default adaptive limits target no more than ~40% CPU/memory pressure for the analysis workers.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import hashlib
 import json
 import logging
+import math
 import os
+import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from random import uniform
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -50,17 +57,18 @@ ORDERBOOK_SUBGRAPH_URL = (
 
 DEFAULT_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "polymarket-analyzer/1.1",
+    "User-Agent": "polymarket-analyzer/2.0",
 }
 GRAPHQL_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "polymarket-analyzer/1.1",
+    "User-Agent": "polymarket-analyzer/2.0",
 }
 
 RETRY_BACKOFF_SECONDS = [1, 5, 10]
-REQUEST_SLEEP_RANGE = (0.6, 1.0)
 NON_RETRYABLE_HTTP_STATUS = {400, 401, 403, 404, 422}
+DEFAULT_REQUEST_INTERVAL_SECONDS = 0.6
+REQUEST_JITTER_SECONDS = 0.25
 
 LEADERBOARD_CATEGORY = "OVERALL"
 LEADERBOARD_TIME_PERIODS = ["ALL", "MONTH", "WEEK", "DAY"]
@@ -68,18 +76,33 @@ LEADERBOARD_ORDER_BY = ["PNL", "VOL"]
 LEADERBOARD_PAGE_LIMIT = 50
 LEADERBOARD_MAX_OFFSET = 1000
 
-# Latest documented caps for /trades and /activity changed on August 26, 2025.
+# Latest documented caps for /trades changed on August 26, 2025.
 TRADES_PAGE_LIMIT = 500
 TRADES_MAX_OFFSET = 1000
 CLOSED_POSITIONS_PAGE_LIMIT = 50
 CLOSED_POSITIONS_MAX_OFFSET = 100000
-MARKETS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 MARKET_LOOKUP_CHUNK_SIZE = 50
+SUBGRAPH_PAGE_SIZE = 1000
+DEFAULT_SUBGRAPH_WALLET_PAGES = 200
 
 DEFAULT_MAX_WALLETS = 100
 DEFAULT_PERIOD_DAYS = 180
+DEFAULT_MAX_CPU_PERCENT = 40.0
+DEFAULT_MAX_MEM_PERCENT = 40.0
+DEFAULT_PER_WORKER_MEMORY_MB = 256
+DEFAULT_HTTP_CACHE_TTL_SECONDS = 6 * 60 * 60
+MARKET_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+REPORT_FLUSH_EVERY = 25
+
+LOGGER = logging.getLogger("polymarket_analyzer")
+HTTP_RATE_LOCK = threading.Lock()
+HTTP_NEXT_ALLOWED_TS = 0.0
+CACHE_WRITE_LOCK = threading.Lock()
 
 
+# =========================
+# Logging and filesystem
+# =========================
 def setup_logging(output_dir: str) -> logging.Logger:
     """Configure console and file logging."""
     os.makedirs(output_dir, exist_ok=True)
@@ -90,7 +113,8 @@ def setup_logging(output_dir: str) -> logging.Logger:
     logger.handlers.clear()
 
     formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -106,15 +130,114 @@ def setup_logging(output_dir: str) -> logging.Logger:
     return logger
 
 
-LOGGER = logging.getLogger("polymarket_analyzer")
+def ensure_dir(path: str) -> str:
+    """Create a directory if needed and return its path."""
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def save_json(path: str, payload: Any) -> None:
+    """Persist JSON with UTF-8 encoding."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+
+def load_json(path: str, default: Any = None) -> Any:
+    """Load JSON or return a default value when the file is absent/broken."""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return default
 
 
 # =========================
-# Utility helpers
+# System profiling and worker sizing
 # =========================
-def rate_limit_sleep() -> None:
-    """Sleep between requests to respect public API rate limits."""
-    time.sleep(uniform(*REQUEST_SLEEP_RANGE))
+def get_total_memory_bytes() -> int:
+    """Best-effort cross-platform total physical memory detection using only stdlib."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        return int(parts[1]) * 1024
+        except OSError:
+            return 0
+
+    if sys.platform == "darwin":
+        try:
+            return int(os.popen("sysctl -n hw.memsize").read().strip())
+        except (OSError, ValueError):
+            return 0
+
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        memory_status = MEMORYSTATUSEX()
+        memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):  # type: ignore[attr-defined]
+            return int(memory_status.ullTotalPhys)
+    return 0
+
+
+def detect_system_profile() -> Dict[str, Any]:
+    """Collect a lightweight machine profile for adaptive worker sizing."""
+    cpu_count = os.cpu_count() or 1
+    memory_bytes = get_total_memory_bytes()
+    memory_gb = round(memory_bytes / (1024 ** 3), 2) if memory_bytes else 0.0
+    return {
+        "cpu_count": cpu_count,
+        "total_memory_bytes": memory_bytes,
+        "total_memory_gb": memory_gb,
+    }
+
+
+def choose_worker_count(
+    system_profile: Dict[str, Any],
+    requested_workers: int,
+    max_cpu_percent: float,
+    max_mem_percent: float,
+    per_worker_memory_mb: int,
+) -> int:
+    """Pick a conservative thread count for network-bound work."""
+    if requested_workers > 0:
+        return max(1, requested_workers)
+
+    cpu_count = max(1, int(system_profile.get("cpu_count") or 1))
+    cpu_based = max(1, int(math.floor(cpu_count * max_cpu_percent / 100.0)))
+
+    memory_bytes = int(system_profile.get("total_memory_bytes") or 0)
+    if memory_bytes > 0 and per_worker_memory_mb > 0:
+        allowed_memory_bytes = memory_bytes * max_mem_percent / 100.0
+        memory_based = max(1, int(allowed_memory_bytes // (per_worker_memory_mb * 1024 * 1024)))
+    else:
+        memory_based = cpu_based
+
+    network_bonus = 2
+    return max(1, min(32, cpu_based + network_bonus, memory_based))
+
+
+# =========================
+# Primitive helpers
+# =========================
+def epoch_now() -> int:
+    """Return current UTC epoch seconds."""
+    return int(datetime.now(timezone.utc).timestamp())
 
 
 def parse_float(value: Any, default: float = 0.0) -> float:
@@ -126,8 +249,8 @@ def parse_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     try:
-        stripped = str(value).replace(",", "").replace("$", "").strip()
-        return float(stripped) if stripped else default
+        normalized = str(value).replace(",", "").replace("$", "").strip()
+        return float(normalized) if normalized else default
     except (TypeError, ValueError):
         return default
 
@@ -143,87 +266,121 @@ def parse_int(value: Any, default: int = 0) -> int:
     if isinstance(value, float):
         return int(value)
     try:
-        stripped = str(value).strip()
-        return int(float(stripped)) if stripped else default
+        return int(float(str(value).strip()))
     except (TypeError, ValueError):
         return default
 
 
 def normalize_wallet(value: Any) -> Optional[str]:
-    """Normalize and validate EVM wallet addresses."""
+    """Normalize an EVM wallet address."""
     if not value:
         return None
-    wallet = str(value).strip()
+    wallet = str(value).strip().lower()
     if wallet.startswith("\\x") and len(wallet) == 42:
         wallet = "0x" + wallet[2:]
-    if wallet.lower().startswith("0x") and len(wallet) == 42:
-        return wallet.lower()
+    if wallet.startswith("0x") and len(wallet) == 42:
+        return wallet
     return None
 
 
-def epoch_now() -> int:
-    """Return current UTC epoch seconds."""
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def ensure_dir(path: str) -> str:
-    """Create directory if missing and return it."""
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def save_json(path: str, payload: Any) -> None:
-    """Write JSON with UTF-8 encoding."""
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-
-
-def load_json(path: str, default: Any = None) -> Any:
-    """Load JSON or return default when unavailable."""
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def extract_timestamp(item: Dict[str, Any]) -> Optional[int]:
-    """Extract a timestamp from multiple possible fields."""
-    candidate_fields = [
+    """Extract a timestamp from common REST and subgraph field names."""
+    for field in (
         "timestamp",
         "timeStamp",
         "createdAt",
         "created_at",
         "updatedAt",
         "lastActiveTimestamp",
-    ]
-    for field in candidate_fields:
-        raw = item.get(field)
-        if raw is None:
+    ):
+        value = item.get(field)
+        if value is None:
             continue
-        if isinstance(raw, (int, float)):
-            ts = int(raw)
-            if ts > 10**12:
-                ts //= 1000
-            return ts
-        if isinstance(raw, str):
-            raw = raw.strip()
-            if raw.isdigit():
-                ts = int(raw)
-                if ts > 10**12:
-                    ts //= 1000
-                return ts
+        if isinstance(value, (int, float)):
+            timestamp = int(value)
+            return timestamp // 1000 if timestamp > 10 ** 12 else timestamp
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isdigit():
+                timestamp = int(stripped)
+                return timestamp // 1000 if timestamp > 10 ** 12 else timestamp
             for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
                 try:
-                    dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+                    dt = datetime.strptime(stripped, fmt).replace(tzinfo=timezone.utc)
                     return int(dt.timestamp())
                 except ValueError:
                     continue
     return None
 
 
+def unwrap_list_payload(payload: Any, keys: Iterable[str]) -> List[Dict[str, Any]]:
+    """Normalize APIs that can return a raw list or a dict with list keys."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def chunked(values: List[str], chunk_size: int) -> Iterable[List[str]]:
+    """Yield fixed-size chunks from a list."""
+    for start in range(0, len(values), chunk_size):
+        yield values[start : start + chunk_size]
+
+
+# =========================
+# Cache and rate limiting
+# =========================
+def get_cache_key(method: str, url: str, params: Optional[Dict[str, Any]], json_payload: Optional[Dict[str, Any]]) -> str:
+    """Build a deterministic cache key for HTTP requests."""
+    raw = json.dumps(
+        {
+            "method": method,
+            "url": url,
+            "params": params or {},
+            "json": json_payload or {},
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_cached_http_response(cache_dir: str, cache_key: str, ttl_seconds: int) -> Any:
+    """Load a cached HTTP response if the TTL is still valid."""
+    cache_path = os.path.join(cache_dir, f"{cache_key}.json")
+    cached = load_json(cache_path, default={})
+    if not isinstance(cached, dict):
+        return None
+    created_at = parse_int(cached.get("created_at"))
+    if created_at and epoch_now() - created_at <= ttl_seconds:
+        return cached.get("payload")
+    return None
+
+
+def set_cached_http_response(cache_dir: str, cache_key: str, payload: Any) -> None:
+    """Persist a GET response in the local HTTP cache."""
+    cache_path = os.path.join(cache_dir, f"{cache_key}.json")
+    with CACHE_WRITE_LOCK:
+        save_json(cache_path, {"created_at": epoch_now(), "payload": payload})
+
+
+def rate_limit_wait(min_interval_seconds: float) -> None:
+    """Global pacing guard shared by all worker threads."""
+    global HTTP_NEXT_ALLOWED_TS
+    with HTTP_RATE_LOCK:
+        now = time.time()
+        if now < HTTP_NEXT_ALLOWED_TS:
+            time.sleep(HTTP_NEXT_ALLOWED_TS - now)
+        HTTP_NEXT_ALLOWED_TS = time.time() + min_interval_seconds + uniform(0.0, REQUEST_JITTER_SECONDS)
+
+
+# =========================
+# HTTP clients
+# =========================
 def request_json(
     method: str,
     url: str,
@@ -232,16 +389,27 @@ def request_json(
     headers: Optional[Dict[str, str]] = None,
     json_payload: Optional[Dict[str, Any]] = None,
     timeout: int = 30,
+    cache_dir: Optional[str] = None,
+    cache_ttl_seconds: int = 0,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
 ) -> Any:
-    """Perform HTTP request with retries, backoff, logging, and rate limiting."""
+    """Perform an HTTP request with retries, pacing, and optional local caching."""
     merged_headers = dict(DEFAULT_HEADERS)
     if headers:
         merged_headers.update(headers)
 
+    if method.upper() == "GET" and cache_dir and cache_ttl_seconds > 0:
+        cache_key = get_cache_key(method, url, params, json_payload)
+        cached_payload = get_cached_http_response(cache_dir, cache_key, cache_ttl_seconds)
+        if cached_payload is not None:
+            return cached_payload
+    else:
+        cache_key = ""
+
     total_attempts = len(RETRY_BACKOFF_SECONDS)
     for attempt_index, backoff in enumerate(RETRY_BACKOFF_SECONDS, start=1):
         try:
-            rate_limit_sleep()
+            rate_limit_wait(request_interval_seconds)
             response = requests.request(
                 method=method,
                 url=url,
@@ -250,19 +418,15 @@ def request_json(
                 headers=merged_headers,
                 timeout=timeout,
             )
-
             if response.status_code >= 400:
-                error = requests.HTTPError(
-                    f"HTTP {response.status_code} for {url}: {response.text[:300]}",
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code} for {url}: {response.text[:400]}",
                     response=response,
                 )
-                if response.status_code in NON_RETRYABLE_HTTP_STATUS:
-                    raise error
-                raise error
-
-            if not response.text.strip():
-                return None
-            return response.json()
+            payload = response.json() if response.text.strip() else None
+            if method.upper() == "GET" and cache_dir and cache_ttl_seconds > 0:
+                set_cached_http_response(cache_dir, cache_key, payload)
+            return payload
         except (requests.RequestException, json.JSONDecodeError) as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
@@ -281,34 +445,8 @@ def request_json(
     return None
 
 
-def graphql_query(url: str, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Execute a GraphQL request against a Goldsky subgraph."""
-    payload = {"query": query, "variables": variables or {}}
-    data = request_json("POST", url, json_payload=payload, headers=GRAPHQL_HEADERS)
-    if not isinstance(data, dict):
-        return {}
-    if data.get("errors"):
-        LOGGER.error("GraphQL returned errors for %s: %s", url, data["errors"])
-    return data
-
-
-# =========================
-# API helpers
-# =========================
-def unwrap_list_payload(payload: Any, keys: Iterable[str]) -> List[Dict[str, Any]]:
-    """Normalize list payloads returned by Polymarket endpoints."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in keys:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
 def request_json_or_empty(*args: Any, **kwargs: Any) -> Any:
-    """Wrap request_json and return None on hard API errors after logging."""
+    """Wrap request_json and turn permanent HTTP failures into empty results."""
     try:
         return request_json(*args, **kwargs)
     except requests.RequestException as exc:
@@ -316,191 +454,70 @@ def request_json_or_empty(*args: Any, **kwargs: Any) -> Any:
         return None
 
 
-def paginate_offset_requests(
+def graphql_query(
     url: str,
+    query: str,
+    variables: Optional[Dict[str, Any]] = None,
     *,
-    params: Optional[Dict[str, Any]],
-    limit: int,
-    max_offset: int,
-    list_keys: Iterable[str],
-) -> List[Dict[str, Any]]:
-    """Collect paginated records using limit/offset semantics."""
-    records: List[Dict[str, Any]] = []
-    offset = 0
-    while offset <= max_offset:
-        current_params = dict(params or {})
-        current_params.update({"limit": limit, "offset": offset})
-        payload = request_json_or_empty("GET", url, params=current_params)
-        page = unwrap_list_payload(payload, list_keys)
-        if not page:
-            break
-        records.extend(page)
-        if len(page) < limit:
-            break
-        offset += limit
-    return records
+    cache_dir: Optional[str] = None,
+    cache_ttl_seconds: int = 0,
+    request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+) -> Dict[str, Any]:
+    """Execute a GraphQL request against a Goldsky subgraph."""
+    payload = request_json_or_empty(
+        "POST",
+        url,
+        json_payload={"query": query, "variables": variables or {}},
+        headers=GRAPHQL_HEADERS,
+        cache_dir=cache_dir,
+        cache_ttl_seconds=cache_ttl_seconds,
+        request_interval_seconds=request_interval_seconds,
+    )
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("errors"):
+        LOGGER.error("GraphQL returned errors for %s: %s", url, payload["errors"])
+    return payload
 
 
 # =========================
-# Leaderboard and wallet collection
-# =========================
-def get_leaderboard() -> Dict[str, Dict[str, float]]:
-    """Collect leaderboard entries across supported time periods and sort options."""
-    leaderboard_wallets: Dict[str, Dict[str, float]] = defaultdict(
-        lambda: {"wallet": "", "volume_usd": 0.0, "pnl_usd": 0.0}
-    )
-
-    total_queries = len(LEADERBOARD_TIME_PERIODS) * len(LEADERBOARD_ORDER_BY)
-    progress = tqdm(total=total_queries, desc="Leaderboard queries")
-    for time_period in LEADERBOARD_TIME_PERIODS:
-        for order_by in LEADERBOARD_ORDER_BY:
-            for offset in range(0, LEADERBOARD_MAX_OFFSET + LEADERBOARD_PAGE_LIMIT, LEADERBOARD_PAGE_LIMIT):
-                params = {
-                    "category": LEADERBOARD_CATEGORY,
-                    "timePeriod": time_period,
-                    "orderBy": order_by,
-                    "limit": LEADERBOARD_PAGE_LIMIT,
-                    "offset": offset,
-                }
-                payload = request_json_or_empty("GET", f"{DATA_API_BASE}/v1/leaderboard", params=params)
-                rows = unwrap_list_payload(payload, ("leaderboard", "data", "results"))
-                if not rows:
-                    break
-                for item in rows:
-                    wallet = normalize_wallet(
-                        item.get("proxyWallet")
-                        or item.get("wallet")
-                        or item.get("user")
-                        or item.get("address")
-                    )
-                    if not wallet:
-                        continue
-                    row = leaderboard_wallets[wallet]
-                    row["wallet"] = wallet
-                    row["volume_usd"] = max(
-                        row["volume_usd"],
-                        parse_float(item.get("vol") or item.get("volume") or item.get("volumeUsd")),
-                    )
-                    row["pnl_usd"] = max(
-                        row["pnl_usd"],
-                        parse_float(item.get("pnl") or item.get("pnlUsd") or item.get("profit")),
-                    )
-                if len(rows) < LEADERBOARD_PAGE_LIMIT:
-                    break
-            progress.update(1)
-    progress.close()
-    return dict(leaderboard_wallets)
-
-
-def fetch_trades_page(user: Optional[str] = None, *, limit: int = TRADES_PAGE_LIMIT, offset: int = 0) -> List[Dict[str, Any]]:
-    """Fetch one page of trades from the Data API using current documented caps."""
-    safe_limit = min(limit, TRADES_PAGE_LIMIT)
-    safe_offset = min(offset, TRADES_MAX_OFFSET)
-    params: Dict[str, Any] = {"limit": safe_limit, "offset": safe_offset}
-    if user:
-        params["user"] = user
-    payload = request_json_or_empty("GET", f"{DATA_API_BASE}/trades", params=params)
-    return unwrap_list_payload(payload, ("trades", "data", "results"))
-
-
-def fetch_closed_positions(user: str) -> List[Dict[str, Any]]:
-    """Fetch all available closed positions for a wallet."""
-    return paginate_offset_requests(
-        f"{DATA_API_BASE}/closed-positions",
-        params={"user": user, "sortBy": "TIMESTAMP"},
-        limit=CLOSED_POSITIONS_PAGE_LIMIT,
-        max_offset=CLOSED_POSITIONS_MAX_OFFSET,
-        list_keys=("positions", "data", "results"),
-    )
-
-
-def collect_wallets(output_dir: str, leaderboard_only: bool = False) -> List[Dict[str, Any]]:
-    """Collect wallet universe from leaderboard and public trades."""
-    wallets_map = get_leaderboard()
-    LOGGER.info("Collected %s unique wallets from leaderboard", len(wallets_map))
-
-    if not leaderboard_only:
-        for offset in tqdm(
-            range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT),
-            desc="Public trades",
-        ):
-            trades = fetch_trades_page(None, limit=TRADES_PAGE_LIMIT, offset=offset)
-            if not trades:
-                break
-            for trade in trades:
-                wallet = normalize_wallet(
-                    trade.get("proxyWallet")
-                    or trade.get("user")
-                    or trade.get("wallet")
-                    or trade.get("maker")
-                    or trade.get("owner")
-                )
-                if not wallet:
-                    continue
-                if wallet not in wallets_map:
-                    wallets_map[wallet] = {
-                        "wallet": wallet,
-                        "volume_usd": 0.0,
-                        "pnl_usd": 0.0,
-                    }
-            if len(trades) < TRADES_PAGE_LIMIT:
-                break
-
-    wallets = [row for row in wallets_map.values() if normalize_wallet(row.get("wallet"))]
-    wallets.sort(
-        key=lambda item: (parse_float(item.get("volume_usd")), parse_float(item.get("pnl_usd"))),
-        reverse=True,
-    )
-
-    wallets_csv_path = os.path.join(output_dir, "wallets.csv")
-    with open(wallets_csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["wallet", "volume_usd", "pnl_usd"])
-        writer.writeheader()
-        writer.writerows(wallets)
-
-    LOGGER.info("Saved %s wallets to %s", len(wallets), wallets_csv_path)
-    return wallets
-
-
-# =========================
-# Market cache and metadata
+# Market cache and lookup
 # =========================
 def get_market_cache(cache_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Load market metadata from cache when still fresh."""
-    ensure_dir(cache_dir)
+    """Load the persisted market cache if it is fresh enough."""
     cache_path = os.path.join(cache_dir, "markets.json")
     cached = load_json(cache_path, default={})
-    if isinstance(cached, dict):
-        fetched_at = parse_int(cached.get("fetched_at"))
-        if fetched_at and epoch_now() - fetched_at < MARKETS_CACHE_MAX_AGE_SECONDS:
-            markets = cached.get("markets", {})
-            if isinstance(markets, dict):
-                return markets
+    if not isinstance(cached, dict):
+        return {}
+    fetched_at = parse_int(cached.get("fetched_at"))
+    if fetched_at and epoch_now() - fetched_at <= MARKET_CACHE_MAX_AGE_SECONDS:
+        markets = cached.get("markets")
+        return markets if isinstance(markets, dict) else {}
     return {}
 
 
 def save_market_cache(cache_dir: str, markets: Dict[str, Dict[str, Any]]) -> None:
-    """Persist market cache with fetch timestamp."""
-    ensure_dir(cache_dir)
+    """Save the on-demand market cache."""
     cache_path = os.path.join(cache_dir, "markets.json")
-    save_json(cache_path, {"fetched_at": epoch_now(), "markets": markets})
+    with CACHE_WRITE_LOCK:
+        save_json(cache_path, {"fetched_at": epoch_now(), "markets": markets})
 
 
 def build_market_record(market: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize market metadata coming from Gamma API."""
+    """Normalize Gamma market metadata."""
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except json.JSONDecodeError:
+            outcomes = [item.strip() for item in outcomes.split(",") if item.strip()]
+
     winning_outcome = (
         market.get("outcome")
         or market.get("resolvedOutcome")
         or market.get("winningOutcome")
         or market.get("resolution")
     )
-    outcomes = market.get("outcomes")
-    if isinstance(outcomes, str):
-        try:
-            outcomes = json.loads(outcomes)
-        except json.JSONDecodeError:
-            outcomes = [chunk.strip() for chunk in outcomes.split(",") if chunk.strip()]
-
     return {
         "condition_id": str(market.get("conditionId") or market.get("questionID") or market.get("id") or ""),
         "market_id": str(market.get("id") or market.get("conditionId") or ""),
@@ -518,22 +535,12 @@ def build_market_record(market: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def fetch_all_markets(cache_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Load the persisted on-demand market cache."""
-    cached = get_market_cache(cache_dir)
-    if cached:
-        LOGGER.info("Loaded %s cached market metadata entries", len(cached))
-    return cached
-
-
-def chunked(values: List[str], chunk_size: int) -> Iterable[List[str]]:
-    """Yield fixed-size chunks from a list."""
-    for start in range(0, len(values), chunk_size):
-        yield values[start : start + chunk_size]
-
-
-def fetch_markets_by_condition_ids(condition_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    """Fetch market metadata in batches using the documented `condition_ids` query parameter."""
+def fetch_markets_by_condition_ids(
+    condition_ids: Iterable[str],
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch market metadata in batches using `condition_ids` to avoid invalid direct-id lookups."""
     unique_ids = sorted({str(item) for item in condition_ids if item})
     if not unique_ids:
         return {}
@@ -544,6 +551,9 @@ def fetch_markets_by_condition_ids(condition_ids: Iterable[str]) -> Dict[str, Di
             "GET",
             f"{GAMMA_API_BASE}/markets",
             params={"condition_ids": batch},
+            cache_dir=http_cache_dir,
+            cache_ttl_seconds=MARKET_CACHE_MAX_AGE_SECONDS,
+            request_interval_seconds=request_interval_seconds,
         )
         rows = unwrap_list_payload(payload, ("markets", "data", "results"))
         for market in rows:
@@ -555,13 +565,188 @@ def fetch_markets_by_condition_ids(condition_ids: Iterable[str]) -> Dict[str, Di
 
 
 # =========================
-# Subgraph fallback
+# Data API: leaderboard, trades, positions
 # =========================
-def fetch_wallet_trades_subgraph(wallet: str, cutoff_ts: int) -> List[Dict[str, Any]]:
-    """Fetch trades from the orderbook subgraph."""
-    results: List[Dict[str, Any]] = []
-    skip = 0
-    first = 1000
+def get_leaderboard(http_cache_dir: str, request_interval_seconds: float) -> Dict[str, Dict[str, float]]:
+    """Collect leaderboard entries across supported periods and sort modes."""
+    wallets: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"wallet": "", "volume_usd": 0.0, "pnl_usd": 0.0}
+    )
+    total_queries = len(LEADERBOARD_TIME_PERIODS) * len(LEADERBOARD_ORDER_BY)
+    progress = tqdm(total=total_queries, desc="Leaderboard queries")
+
+    for time_period in LEADERBOARD_TIME_PERIODS:
+        for order_by in LEADERBOARD_ORDER_BY:
+            for offset in range(0, LEADERBOARD_MAX_OFFSET + LEADERBOARD_PAGE_LIMIT, LEADERBOARD_PAGE_LIMIT):
+                payload = request_json_or_empty(
+                    "GET",
+                    f"{DATA_API_BASE}/v1/leaderboard",
+                    params={
+                        "category": LEADERBOARD_CATEGORY,
+                        "timePeriod": time_period,
+                        "orderBy": order_by,
+                        "limit": LEADERBOARD_PAGE_LIMIT,
+                        "offset": offset,
+                    },
+                    cache_dir=http_cache_dir,
+                    cache_ttl_seconds=12 * 60 * 60,
+                    request_interval_seconds=request_interval_seconds,
+                )
+                rows = unwrap_list_payload(payload, ("leaderboard", "data", "results"))
+                if not rows:
+                    break
+                for item in rows:
+                    wallet = normalize_wallet(
+                        item.get("proxyWallet")
+                        or item.get("wallet")
+                        or item.get("user")
+                        or item.get("address")
+                    )
+                    if not wallet:
+                        continue
+                    row = wallets[wallet]
+                    row["wallet"] = wallet
+                    row["volume_usd"] = max(
+                        row["volume_usd"],
+                        parse_float(item.get("vol") or item.get("volume") or item.get("volumeUsd")),
+                    )
+                    row["pnl_usd"] = max(
+                        row["pnl_usd"],
+                        parse_float(item.get("pnl") or item.get("pnlUsd") or item.get("profit")),
+                    )
+                if len(rows) < LEADERBOARD_PAGE_LIMIT:
+                    break
+            progress.update(1)
+    progress.close()
+    return dict(wallets)
+
+
+def fetch_trades_page(
+    user: Optional[str],
+    offset: int,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Fetch one capped Data API trades page."""
+    payload = request_json_or_empty(
+        "GET",
+        f"{DATA_API_BASE}/trades",
+        params={
+            "limit": TRADES_PAGE_LIMIT,
+            "offset": min(offset, TRADES_MAX_OFFSET),
+            **({"user": user} if user else {}),
+        },
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+        request_interval_seconds=request_interval_seconds,
+    )
+    return unwrap_list_payload(payload, ("trades", "data", "results"))
+
+
+def fetch_wallet_trades(wallet: str, cutoff_ts: int, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
+    """Fetch a wallet's trades via Data API with time-based early stop."""
+    trades: List[Dict[str, Any]] = []
+    for offset in range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT):
+        page = fetch_trades_page(wallet, offset, http_cache_dir, request_interval_seconds)
+        if not page:
+            break
+        reached_cutoff = False
+        for trade in page:
+            timestamp = extract_timestamp(trade)
+            if timestamp is None or timestamp >= cutoff_ts:
+                trades.append(trade)
+            else:
+                reached_cutoff = True
+        if len(page) < TRADES_PAGE_LIMIT or reached_cutoff:
+            break
+    return trades
+
+
+def fetch_closed_positions(wallet: str, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
+    """Fetch closed positions for a wallet."""
+    records: List[Dict[str, Any]] = []
+    for offset in range(0, CLOSED_POSITIONS_MAX_OFFSET + CLOSED_POSITIONS_PAGE_LIMIT, CLOSED_POSITIONS_PAGE_LIMIT):
+        payload = request_json_or_empty(
+            "GET",
+            f"{DATA_API_BASE}/closed-positions",
+            params={
+                "user": wallet,
+                "limit": CLOSED_POSITIONS_PAGE_LIMIT,
+                "offset": offset,
+                "sortBy": "TIMESTAMP",
+            },
+            cache_dir=http_cache_dir,
+            cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+            request_interval_seconds=request_interval_seconds,
+        )
+        page = unwrap_list_payload(payload, ("positions", "data", "results"))
+        if not page:
+            break
+        records.extend(page)
+        if len(page) < CLOSED_POSITIONS_PAGE_LIMIT:
+            break
+    return records
+
+
+# =========================
+# Subgraph discovery and fallback
+# =========================
+def fetch_subgraph_wallets(
+    url: str,
+    entity: str,
+    field_names: List[str],
+    max_pages: int,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[str]:
+    """Scan a Goldsky entity and extract unique wallet fields."""
+    if max_pages <= 0:
+        return []
+
+    requested_fields = "\n        ".join(field_names)
+    query = f"""
+    query ScanEntity($first: Int!, $skip: Int!) {{
+      {entity}(
+        first: $first
+        skip: $skip
+        orderBy: id
+        orderDirection: asc
+      ) {{
+        {requested_fields}
+      }}
+    }}
+    """
+
+    wallets = set()
+    for page_index in tqdm(range(max_pages), desc=f"Subgraph {entity}"):
+        payload = graphql_query(
+            url,
+            query,
+            {"first": SUBGRAPH_PAGE_SIZE, "skip": page_index * SUBGRAPH_PAGE_SIZE},
+            cache_dir=http_cache_dir,
+            cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+            request_interval_seconds=request_interval_seconds,
+        )
+        rows = payload.get("data", {}).get(entity, []) if isinstance(payload, dict) else []
+        if not rows:
+            break
+        for row in rows:
+            for field_name in field_names:
+                wallet = normalize_wallet(row.get(field_name))
+                if wallet:
+                    wallets.add(wallet)
+        if len(rows) < SUBGRAPH_PAGE_SIZE:
+            break
+    return sorted(wallets)
+
+
+def fetch_wallet_trades_subgraph(
+    wallet: str,
+    cutoff_ts: int,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Fetch wallet order rows from the orderbook subgraph."""
     query = """
     query WalletOrders($wallet: String!, $first: Int!, $skip: Int!) {
       orders(
@@ -583,30 +768,32 @@ def fetch_wallet_trades_subgraph(wallet: str, cutoff_ts: int) -> List[Dict[str, 
       }
     }
     """
-
-    while True:
+    results: List[Dict[str, Any]] = []
+    for page_index in range(DEFAULT_SUBGRAPH_WALLET_PAGES):
         payload = graphql_query(
             ORDERBOOK_SUBGRAPH_URL,
             query,
-            {"wallet": wallet, "first": first, "skip": skip},
+            {"wallet": wallet, "first": SUBGRAPH_PAGE_SIZE, "skip": page_index * SUBGRAPH_PAGE_SIZE},
+            cache_dir=http_cache_dir,
+            cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+            request_interval_seconds=request_interval_seconds,
         )
-        page = payload.get("data", {}).get("orders", []) if isinstance(payload, dict) else []
-        if not page:
+        rows = payload.get("data", {}).get("orders", []) if isinstance(payload, dict) else []
+        if not rows:
             break
         reached_cutoff = False
-        for order in page:
-            ts = extract_timestamp(order)
-            if ts is not None and ts < cutoff_ts:
+        for row in rows:
+            timestamp = extract_timestamp(row)
+            if timestamp is not None and timestamp < cutoff_ts:
                 reached_cutoff = True
                 continue
-            results.append(order)
-        skip += len(page)
-        if len(page) < first or reached_cutoff:
+            results.append(row)
+        if len(rows) < SUBGRAPH_PAGE_SIZE or reached_cutoff:
             break
     return results
 
 
-def fetch_wallet_pnl_subgraph(wallet: str) -> List[Dict[str, Any]]:
+def fetch_wallet_pnl_subgraph(wallet: str, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
     """Fetch realized PnL rows from the pnl subgraph."""
     query = """
     query WalletPnl($wallet: String!) {
@@ -619,12 +806,19 @@ def fetch_wallet_pnl_subgraph(wallet: str) -> List[Dict[str, Any]]:
       }
     }
     """
-    payload = graphql_query(PNL_SUBGRAPH_URL, query, {"wallet": wallet})
+    payload = graphql_query(
+        PNL_SUBGRAPH_URL,
+        query,
+        {"wallet": wallet},
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+        request_interval_seconds=request_interval_seconds,
+    )
     return payload.get("data", {}).get("pnls", []) if isinstance(payload, dict) else []
 
 
-def fetch_wallet_positions_subgraph(wallet: str) -> List[Dict[str, Any]]:
-    """Fetch historical positions from the positions subgraph as an auxiliary fallback."""
+def fetch_wallet_positions_subgraph(wallet: str, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
+    """Fetch position rows from the positions subgraph."""
     query = """
     query WalletPositions($wallet: String!) {
       positions(where: { user: $wallet }) {
@@ -639,15 +833,105 @@ def fetch_wallet_positions_subgraph(wallet: str) -> List[Dict[str, Any]]:
       }
     }
     """
-    payload = graphql_query(POSITIONS_SUBGRAPH_URL, query, {"wallet": wallet})
+    payload = graphql_query(
+        POSITIONS_SUBGRAPH_URL,
+        query,
+        {"wallet": wallet},
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+        request_interval_seconds=request_interval_seconds,
+    )
     return payload.get("data", {}).get("positions", []) if isinstance(payload, dict) else []
+
+
+# =========================
+# Wallet collection
+# =========================
+def collect_wallets(
+    output_dir: str,
+    leaderboard_only: bool,
+    subgraph_wallet_pages: int,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Collect the broadest possible wallet universe for downstream filtering."""
+    source_counts: Dict[str, int] = defaultdict(int)
+    wallets_map = get_leaderboard(http_cache_dir, request_interval_seconds)
+    source_counts["leaderboard"] = len(wallets_map)
+    LOGGER.info("Collected %s unique wallets from leaderboard", len(wallets_map))
+
+    if not leaderboard_only:
+        for offset in tqdm(range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT), desc="Public trades"):
+            rows = fetch_trades_page(None, offset, http_cache_dir, request_interval_seconds)
+            if not rows:
+                break
+            for trade in rows:
+                wallet = normalize_wallet(
+                    trade.get("proxyWallet")
+                    or trade.get("user")
+                    or trade.get("wallet")
+                    or trade.get("maker")
+                    or trade.get("owner")
+                )
+                if wallet and wallet not in wallets_map:
+                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                    source_counts["public_trades"] += 1
+            if len(rows) < TRADES_PAGE_LIMIT:
+                break
+
+        subgraph_sources = [
+            (ORDERBOOK_SUBGRAPH_URL, "orders", ["user"]),
+            (PNL_SUBGRAPH_URL, "pnls", ["user"]),
+            (POSITIONS_SUBGRAPH_URL, "positions", ["user"]),
+        ]
+        for url, entity, field_names in subgraph_sources:
+            discovered = fetch_subgraph_wallets(
+                url,
+                entity,
+                field_names,
+                subgraph_wallet_pages,
+                http_cache_dir,
+                request_interval_seconds,
+            )
+            added = 0
+            for wallet in discovered:
+                if wallet not in wallets_map:
+                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                    added += 1
+            source_counts[f"subgraph_{entity}"] = added
+            LOGGER.info("Added %s wallets from %s subgraph scan", added, entity)
+
+    wallets = [item for item in wallets_map.values() if normalize_wallet(item.get("wallet"))]
+    wallets.sort(
+        key=lambda item: (parse_float(item.get("volume_usd")), parse_float(item.get("pnl_usd"))),
+        reverse=True,
+    )
+
+    wallets_csv_path = os.path.join(output_dir, "wallets.csv")
+    with open(wallets_csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["wallet", "volume_usd", "pnl_usd"])
+        writer.writeheader()
+        writer.writerows(wallets)
+
+    LOGGER.info("Saved %s wallets to %s", len(wallets), wallets_csv_path)
+    LOGGER.info("Wallet source breakdown: %s", dict(source_counts))
+    return wallets
 
 
 # =========================
 # Analysis helpers
 # =========================
+def infer_condition_id(item: Dict[str, Any]) -> Optional[str]:
+    """Infer a market grouping key."""
+    for field in ("conditionId", "market", "marketId", "questionID", "slug"):
+        value = item.get(field)
+        if value:
+            return str(value)
+    return None
+
+
 def infer_trade_side(trade: Dict[str, Any]) -> str:
-    """Infer whether the trade is a buy or sell."""
+    """Infer buy/sell side from a trade row."""
     raw = str(trade.get("side") or trade.get("type") or trade.get("action") or "").strip().lower()
     if raw in {"buy", "bid", "bought"}:
         return "buy"
@@ -657,7 +941,7 @@ def infer_trade_side(trade: Dict[str, Any]) -> str:
 
 
 def infer_trade_outcome(trade: Dict[str, Any]) -> str:
-    """Infer YES/NO or token outcome text from a trade payload."""
+    """Infer outcome label from a trade row."""
     for field in ("outcome", "outcomeIndex", "tokenOutcome", "tokenId", "asset"):
         value = trade.get(field)
         if value is None:
@@ -679,66 +963,29 @@ def infer_trade_outcome(trade: Dict[str, Any]) -> str:
 
 
 def infer_trade_volume_usd(trade: Dict[str, Any]) -> float:
-    """Estimate USD notional for a trade."""
+    """Estimate trade notional in USD."""
     for field in ("volume", "volumeUsd", "usdcSize", "amountUsd", "notionalUsd"):
-        amount = parse_float(trade.get(field))
-        if amount > 0:
-            return amount
+        value = parse_float(trade.get(field))
+        if value > 0:
+            return value
     price = parse_float(trade.get("price") or trade.get("avgPrice"))
-    size = parse_float(trade.get("size") or trade.get("amount") or trade.get("shares") or trade.get("totalBought"))
+    size = parse_float(
+        trade.get("size") or trade.get("amount") or trade.get("shares") or trade.get("totalBought")
+    )
     return price * size if price > 0 and size > 0 else 0.0
 
 
-def infer_condition_id(item: Dict[str, Any]) -> Optional[str]:
-    """Infer the grouping identifier for a market position or trade."""
-    for field in ("conditionId", "market", "marketId", "questionID", "slug"):
-        value = item.get(field)
-        if value:
-            return str(value)
-    return None
-
-
-def fetch_wallet_trades(wallet: str, cutoff_ts: int) -> List[Dict[str, Any]]:
-    """Fetch user trades using the capped Data API pagination."""
-    trades: List[Dict[str, Any]] = []
-    for offset in range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT):
-        page = fetch_trades_page(wallet, limit=TRADES_PAGE_LIMIT, offset=offset)
-        if not page:
-            break
-        reached_cutoff = False
-        for trade in page:
-            ts = extract_timestamp(trade)
-            if ts is None or ts >= cutoff_ts:
-                trades.append(trade)
-            else:
-                reached_cutoff = True
-        if len(page) < TRADES_PAGE_LIMIT or reached_cutoff:
-            break
-    return trades
-
-
-def sum_realized_pnl_from_closed_positions(records: Iterable[Dict[str, Any]]) -> Dict[str, float]:
-    """Aggregate realized PnL by condition ID from closed positions."""
-    realized_by_market: Dict[str, float] = defaultdict(float)
+def sum_realized_pnl(records: Iterable[Dict[str, Any]]) -> Dict[str, float]:
+    """Aggregate realized PnL by condition id from heterogeneous sources."""
+    totals: Dict[str, float] = defaultdict(float)
     for row in records:
         condition_id = infer_condition_id(row)
         if not condition_id:
             continue
-        realized_by_market[condition_id] += parse_float(
+        totals[condition_id] += parse_float(
             row.get("realizedPnl") or row.get("pnl") or row.get("profit") or row.get("amount")
         )
-    return dict(realized_by_market)
-
-
-def sum_realized_pnl_from_subgraph(records: Iterable[Dict[str, Any]]) -> Dict[str, float]:
-    """Aggregate realized PnL by condition ID from subgraph rows."""
-    realized_by_market: Dict[str, float] = defaultdict(float)
-    for row in records:
-        condition_id = infer_condition_id(row)
-        if not condition_id:
-            continue
-        realized_by_market[condition_id] += parse_float(row.get("realizedPnl"))
-    return dict(realized_by_market)
+    return dict(totals)
 
 
 def classify_market_win(
@@ -746,7 +993,7 @@ def classify_market_win(
     market: Dict[str, Any],
     realized_pnl: float,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Determine whether a resolved market counts as a win."""
+    """Classify a resolved market as win or loss."""
     winning_outcome = str(market.get("winning_outcome") or "").strip().lower()
     buys_yes = 0.0
     buys_no = 0.0
@@ -770,13 +1017,13 @@ def classify_market_win(
 
     net_yes = buys_yes - sells_yes
     net_no = buys_no - sells_no
-    expected_win = False
+    predicted_win = False
     if winning_outcome == "yes":
-        expected_win = net_yes > net_no
+        predicted_win = net_yes > net_no
     elif winning_outcome == "no":
-        expected_win = net_no > net_yes
+        predicted_win = net_no > net_yes
 
-    is_win = realized_pnl > 0 or expected_win
+    is_win = realized_pnl > 0 or predicted_win
     return is_win, {
         "winning_outcome": market.get("winning_outcome"),
         "realized_pnl": round(realized_pnl, 6),
@@ -789,11 +1036,139 @@ def classify_market_win(
     }
 
 
+# =========================
+# Wallet analysis
+# =========================
+def analyze_wallet(
+    wallet: str,
+    period_days: int,
+    use_subgraph: bool,
+    cache_dir: str,
+    http_cache_dir: str,
+    markets_cache: Dict[str, Dict[str, Any]],
+    markets_cache_lock: threading.Lock,
+    request_interval_seconds: float,
+) -> Dict[str, Any]:
+    """Analyze one wallet and compute profitability metrics for the last N days."""
+    cutoff_ts = epoch_now() - period_days * 24 * 60 * 60
+    wallet_trades = (
+        fetch_wallet_trades_subgraph(wallet, cutoff_ts, http_cache_dir, request_interval_seconds)
+        if use_subgraph
+        else fetch_wallet_trades(wallet, cutoff_ts, http_cache_dir, request_interval_seconds)
+    )
+    closed_positions = [] if use_subgraph else fetch_closed_positions(wallet, http_cache_dir, request_interval_seconds)
+    pnl_subgraph = fetch_wallet_pnl_subgraph(wallet, http_cache_dir, request_interval_seconds)
+    positions_subgraph = fetch_wallet_positions_subgraph(wallet, http_cache_dir, request_interval_seconds)
+
+    realized_pnl_map = sum_realized_pnl(closed_positions)
+    for pnl_map in (sum_realized_pnl(pnl_subgraph), sum_realized_pnl(positions_subgraph)):
+        for key, value in pnl_map.items():
+            realized_pnl_map[key] = realized_pnl_map.get(key, 0.0) + value
+
+    trades_by_market: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    total_volume_usd = 0.0
+    trade_timestamps: List[int] = []
+    for trade in wallet_trades:
+        condition_id = infer_condition_id(trade)
+        if not condition_id:
+            continue
+        trades_by_market[condition_id].append(trade)
+        total_volume_usd += infer_trade_volume_usd(trade)
+        timestamp = extract_timestamp(trade)
+        if timestamp is not None:
+            trade_timestamps.append(timestamp)
+
+    missing_condition_ids = []
+    with markets_cache_lock:
+        for condition_id in trades_by_market:
+            if condition_id not in markets_cache:
+                missing_condition_ids.append(condition_id)
+
+    if missing_condition_ids:
+        fetched_markets = fetch_markets_by_condition_ids(
+            missing_condition_ids,
+            http_cache_dir,
+            request_interval_seconds,
+        )
+        if fetched_markets:
+            with markets_cache_lock:
+                markets_cache.update(fetched_markets)
+                save_market_cache(cache_dir, markets_cache)
+
+    winning_markets = 0
+    total_resolved_markets = 0
+    market_rows: List[Dict[str, Any]] = []
+
+    with markets_cache_lock:
+        local_market_snapshot = dict(markets_cache)
+
+    for condition_id, market_trades in trades_by_market.items():
+        market_info = local_market_snapshot.get(condition_id) or {
+            "condition_id": condition_id,
+            "market_id": condition_id,
+            "question": "Unknown market",
+            "resolved": False,
+            "winning_outcome": None,
+        }
+        realized_pnl = realized_pnl_map.get(condition_id, 0.0)
+        row = {
+            "condition_id": condition_id,
+            "market_id": market_info.get("market_id"),
+            "question": market_info.get("question"),
+            "resolved": bool(market_info.get("resolved")),
+            "winning_outcome": market_info.get("winning_outcome"),
+            "trade_count": len(market_trades),
+            "volume_usd": round(sum(infer_trade_volume_usd(item) for item in market_trades), 6),
+            "realized_pnl_usd": round(realized_pnl, 6),
+        }
+        if row["resolved"]:
+            total_resolved_markets += 1
+            is_win, diagnostics = classify_market_win(market_trades, market_info, realized_pnl)
+            if is_win:
+                winning_markets += 1
+            row["is_win"] = is_win
+            row.update(diagnostics)
+        else:
+            row["is_win"] = None
+        market_rows.append(row)
+
+    total_pnl_usd = sum(realized_pnl_map.get(condition_id, 0.0) for condition_id in trades_by_market)
+    total_trades = sum(len(items) for items in trades_by_market.values())
+    active_days = len(
+        {
+            datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+            for timestamp in trade_timestamps
+        }
+    )
+    avg_bet_size = total_volume_usd / total_trades if total_trades else 0.0
+    winrate = (winning_markets / total_resolved_markets * 100.0) if total_resolved_markets else 0.0
+    roi = (total_pnl_usd / total_volume_usd * 100.0) if total_volume_usd else 0.0
+    profitable = total_pnl_usd > 0
+
+    return {
+        "wallet": wallet,
+        "period_days": period_days,
+        "profitable": profitable,
+        "total_trades": total_trades,
+        "total_markets": len(trades_by_market),
+        "total_resolved_markets": total_resolved_markets,
+        "winning_markets": winning_markets,
+        "winrate_%": round(winrate, 4),
+        "total_volume_usd": round(total_volume_usd, 6),
+        "total_pnl_usd": round(total_pnl_usd, 6),
+        "roi": round(roi, 4),
+        "avg_bet_size": round(avg_bet_size, 6),
+        "active_days": active_days,
+        "markets": sorted(market_rows, key=lambda item: item["volume_usd"], reverse=True),
+    }
+
+
 def write_results_csv(path: str, rows: List[Dict[str, Any]]) -> None:
-    """Write aggregate wallet metrics to CSV without requiring pandas."""
+    """Write aggregate wallet metrics to CSV."""
     fieldnames = [
         "wallet",
         "period_days",
+        "profitable",
         "winrate_%",
         "winning_markets",
         "total_resolved_markets",
@@ -809,117 +1184,7 @@ def write_results_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow({field: row.get(field) for field in fieldnames})
-
-
-def analyze_wallet(
-    wallet: str,
-    markets_cache: Dict[str, Dict[str, Any]],
-    period_days: int,
-    cache_dir: str,
-    use_subgraph: bool = False,
-) -> Dict[str, Any]:
-    """Analyze one wallet's recent trading performance and win rate."""
-    cutoff_ts = epoch_now() - period_days * 24 * 60 * 60
-    wallet_trades = (
-        fetch_wallet_trades_subgraph(wallet, cutoff_ts) if use_subgraph else fetch_wallet_trades(wallet, cutoff_ts)
-    )
-    closed_positions = [] if use_subgraph else fetch_closed_positions(wallet)
-    pnl_subgraph = fetch_wallet_pnl_subgraph(wallet) if use_subgraph else []
-    positions_subgraph = fetch_wallet_positions_subgraph(wallet) if use_subgraph else []
-
-    realized_pnl_map = sum_realized_pnl_from_closed_positions(closed_positions)
-    for pnl_map in (sum_realized_pnl_from_subgraph(pnl_subgraph), sum_realized_pnl_from_subgraph(positions_subgraph)):
-        for key, value in pnl_map.items():
-            realized_pnl_map[key] = realized_pnl_map.get(key, 0.0) + value
-
-    trades_by_market: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    total_volume_usd = 0.0
-    trade_timestamps: List[int] = []
-
-    for trade in wallet_trades:
-        condition_id = infer_condition_id(trade)
-        if not condition_id:
-            continue
-        trades_by_market[condition_id].append(trade)
-        total_volume_usd += infer_trade_volume_usd(trade)
-        ts = extract_timestamp(trade)
-        if ts is not None:
-            trade_timestamps.append(ts)
-
-    missing_condition_ids = [
-        condition_id for condition_id in trades_by_market if condition_id not in markets_cache
-    ]
-    if missing_condition_ids:
-        fetched_markets = fetch_markets_by_condition_ids(missing_condition_ids)
-        if fetched_markets:
-            markets_cache.update(fetched_markets)
-            save_market_cache(cache_dir, markets_cache)
-
-    winning_markets = 0
-    total_resolved_markets = 0
-    market_rows: List[Dict[str, Any]] = []
-
-    for condition_id, market_trades in trades_by_market.items():
-        market_info = markets_cache.get(condition_id)
-        if not market_info:
-            market_info = {
-                "condition_id": condition_id,
-                "market_id": condition_id,
-                "question": "Unknown market",
-                "resolved": False,
-                "winning_outcome": None,
-            }
-
-        realized_pnl = realized_pnl_map.get(condition_id, 0.0)
-        market_row = {
-            "condition_id": condition_id,
-            "market_id": market_info.get("market_id"),
-            "question": market_info.get("question"),
-            "resolved": bool(market_info.get("resolved")),
-            "winning_outcome": market_info.get("winning_outcome"),
-            "trade_count": len(market_trades),
-            "volume_usd": round(sum(infer_trade_volume_usd(item) for item in market_trades), 6),
-            "realized_pnl_usd": round(realized_pnl, 6),
-        }
-        if market_row["resolved"]:
-            total_resolved_markets += 1
-            is_win, diagnostics = classify_market_win(market_trades, market_info, realized_pnl)
-            if is_win:
-                winning_markets += 1
-            market_row["is_win"] = is_win
-            market_row.update(diagnostics)
-        else:
-            market_row["is_win"] = None
-        market_rows.append(market_row)
-
-    total_pnl_usd = sum(realized_pnl_map.get(condition_id, 0.0) for condition_id in trades_by_market)
-    active_days = len(
-        {
-            datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-            for ts in trade_timestamps
-        }
-    )
-    total_trades = sum(len(items) for items in trades_by_market.values())
-    avg_bet_size = total_volume_usd / total_trades if total_trades else 0.0
-    winrate = (winning_markets / total_resolved_markets * 100.0) if total_resolved_markets else 0.0
-    roi = (total_pnl_usd / total_volume_usd * 100.0) if total_volume_usd else 0.0
-
-    return {
-        "wallet": wallet,
-        "period_days": period_days,
-        "total_trades": total_trades,
-        "total_markets": len(trades_by_market),
-        "total_resolved_markets": total_resolved_markets,
-        "winning_markets": winning_markets,
-        "winrate_%": round(winrate, 4),
-        "total_volume_usd": round(total_volume_usd, 6),
-        "total_pnl_usd": round(total_pnl_usd, 6),
-        "roi": round(roi, 4),
-        "avg_bet_size": round(avg_bet_size, 6),
-        "active_days": active_days,
-        "markets": sorted(market_rows, key=lambda item: item["volume_usd"], reverse=True),
-    }
+            writer.writerow({name: row.get(name) for name in fieldnames})
 
 
 def analyze_wallets(
@@ -928,90 +1193,161 @@ def analyze_wallets(
     period_days: int,
     max_wallets: int,
     use_subgraph: bool,
+    workers: int,
+    request_interval_seconds: float,
 ) -> List[Dict[str, Any]]:
-    """Analyze a wallet cohort and save CSV/JSON outputs."""
+    """Analyze wallets concurrently and persist aggregate + per-wallet reports."""
     reports_dir = ensure_dir(os.path.join(output_dir, "reports"))
     cache_dir = ensure_dir(os.path.join(output_dir, "cache"))
-    markets_cache = fetch_all_markets(cache_dir)
+    http_cache_dir = ensure_dir(os.path.join(cache_dir, "http"))
+    markets_cache = get_market_cache(cache_dir)
+    markets_cache_lock = threading.Lock()
 
+    selected_wallets = wallets[:max_wallets]
     results: List[Dict[str, Any]] = []
-    for row in tqdm(wallets[:max_wallets], desc="Wallet analysis"):
-        wallet = row["wallet"]
-        try:
-            report = analyze_wallet(
-                wallet=wallet,
-                markets_cache=markets_cache,
-                period_days=period_days,
-                cache_dir=cache_dir,
-                use_subgraph=use_subgraph,
-            )
-        except requests.RequestException as exc:
-            LOGGER.error("Wallet analysis failed for %s: %s", wallet, exc)
-            report = {
-                "wallet": wallet,
-                "period_days": period_days,
-                "total_trades": 0,
-                "total_markets": 0,
-                "total_resolved_markets": 0,
-                "winning_markets": 0,
-                "winrate_%": 0.0,
-                "total_volume_usd": 0.0,
-                "total_pnl_usd": 0.0,
-                "roi": 0.0,
-                "avg_bet_size": 0.0,
-                "active_days": 0,
-                "markets": [],
-                "error": str(exc),
-            }
-        save_json(os.path.join(reports_dir, f"{wallet}.json"), report)
-        results.append(report)
+    profitable_results: List[Dict[str, Any]] = []
 
-    results.sort(
-        key=lambda item: (parse_float(item.get("winrate_%")), parse_float(item.get("total_pnl_usd"))),
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(
+                analyze_wallet,
+                wallet=row["wallet"],
+                period_days=period_days,
+                use_subgraph=use_subgraph,
+                cache_dir=cache_dir,
+                http_cache_dir=http_cache_dir,
+                markets_cache=markets_cache,
+                markets_cache_lock=markets_cache_lock,
+                request_interval_seconds=request_interval_seconds,
+            ): row["wallet"]
+            for row in selected_wallets
+        }
+
+        progress = tqdm(total=len(future_map), desc="Wallet analysis")
+        for index, future in enumerate(as_completed(future_map), start=1):
+            wallet = future_map[future]
+            try:
+                report = future.result()
+            except requests.RequestException as exc:
+                LOGGER.error("Wallet analysis failed for %s: %s", wallet, exc)
+                report = {
+                    "wallet": wallet,
+                    "period_days": period_days,
+                    "profitable": False,
+                    "total_trades": 0,
+                    "total_markets": 0,
+                    "total_resolved_markets": 0,
+                    "winning_markets": 0,
+                    "winrate_%": 0.0,
+                    "total_volume_usd": 0.0,
+                    "total_pnl_usd": 0.0,
+                    "roi": 0.0,
+                    "avg_bet_size": 0.0,
+                    "active_days": 0,
+                    "markets": [],
+                    "error": str(exc),
+                }
+            results.append(report)
+            if report.get("profitable"):
+                profitable_results.append(report)
+            save_json(os.path.join(reports_dir, f"{wallet}.json"), report)
+            if index % REPORT_FLUSH_EVERY == 0:
+                profitable_results.sort(
+                    key=lambda item: (
+                        parse_float(item.get("winrate_%")),
+                        parse_float(item.get("total_pnl_usd")),
+                        parse_float(item.get("roi")),
+                    ),
+                    reverse=True,
+                )
+                write_results_csv(os.path.join(output_dir, "results.csv"), profitable_results)
+                save_json(os.path.join(output_dir, "detailed_report.json"), profitable_results)
+            progress.update(1)
+        progress.close()
+
+    profitable_results.sort(
+        key=lambda item: (
+            parse_float(item.get("winrate_%")),
+            parse_float(item.get("total_pnl_usd")),
+            parse_float(item.get("roi")),
+        ),
         reverse=True,
     )
-    write_results_csv(os.path.join(output_dir, "results.csv"), results)
-    save_json(os.path.join(output_dir, "detailed_report.json"), results)
-    LOGGER.info("Saved %s wallet reports", len(results))
-    return results
+    write_results_csv(os.path.join(output_dir, "results.csv"), profitable_results)
+    save_json(os.path.join(output_dir, "detailed_report.json"), profitable_results)
+    save_json(os.path.join(output_dir, "all_results.json"), results)
+    LOGGER.info("Finished analysis: %s profitable wallets out of %s analyzed", len(profitable_results), len(results))
+    return profitable_results
 
 
 # =========================
 # CLI
 # =========================
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
+    """Build the command-line interface."""
     parser = argparse.ArgumentParser(
-        description="Collect Polymarket proxy wallets and analyze wallet win rate over a configurable period."
+        description="Collect Polymarket wallets, rank profitable traders over the last N days, and export candidate copy-trading reports."
     )
     parser.add_argument("--max_wallets", type=int, default=DEFAULT_MAX_WALLETS)
     parser.add_argument("--period_days", type=int, default=DEFAULT_PERIOD_DAYS)
     parser.add_argument("--output_dir", type=str, default="./polymarket_analysis")
     parser.add_argument("--use_subgraph", action="store_true")
     parser.add_argument("--leaderboard_only", action="store_true")
+    parser.add_argument("--workers", type=int, default=0, help="0 = auto-detect safe worker count")
+    parser.add_argument("--max_cpu_percent", type=float, default=DEFAULT_MAX_CPU_PERCENT)
+    parser.add_argument("--max_mem_percent", type=float, default=DEFAULT_MAX_MEM_PERCENT)
+    parser.add_argument("--per_worker_memory_mb", type=int, default=DEFAULT_PER_WORKER_MEMORY_MB)
+    parser.add_argument("--subgraph_wallet_pages", type=int, default=DEFAULT_SUBGRAPH_WALLET_PAGES)
+    parser.add_argument("--request_interval_seconds", type=float, default=DEFAULT_REQUEST_INTERVAL_SECONDS)
     return parser
 
 
 def main() -> None:
     """Script entrypoint."""
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
+    args = build_arg_parser().parse_args()
     output_dir = ensure_dir(args.output_dir)
+    cache_dir = ensure_dir(os.path.join(output_dir, "cache"))
+    http_cache_dir = ensure_dir(os.path.join(cache_dir, "http"))
+
     global LOGGER
     LOGGER = setup_logging(output_dir)
 
+    system_profile = detect_system_profile()
+    workers = choose_worker_count(
+        system_profile,
+        args.workers,
+        args.max_cpu_percent,
+        args.max_mem_percent,
+        args.per_worker_memory_mb,
+    )
+
     LOGGER.info("Starting Polymarket analyzer")
     LOGGER.info(
-        "Arguments: max_wallets=%s period_days=%s output_dir=%s use_subgraph=%s leaderboard_only=%s",
+        "System profile: cpu_count=%s total_memory_gb=%s chosen_workers=%s",
+        system_profile.get("cpu_count"),
+        system_profile.get("total_memory_gb"),
+        workers,
+    )
+    LOGGER.info(
+        "Arguments: max_wallets=%s period_days=%s output_dir=%s use_subgraph=%s leaderboard_only=%s subgraph_wallet_pages=%s max_cpu_percent=%s max_mem_percent=%s request_interval_seconds=%s",
         args.max_wallets,
         args.period_days,
         args.output_dir,
         args.use_subgraph,
         args.leaderboard_only,
+        args.subgraph_wallet_pages,
+        args.max_cpu_percent,
+        args.max_mem_percent,
+        args.request_interval_seconds,
     )
 
-    wallets = collect_wallets(output_dir=output_dir, leaderboard_only=args.leaderboard_only)
+    wallets = collect_wallets(
+        output_dir=output_dir,
+        leaderboard_only=args.leaderboard_only,
+        subgraph_wallet_pages=args.subgraph_wallet_pages,
+        http_cache_dir=http_cache_dir,
+        request_interval_seconds=args.request_interval_seconds,
+    )
     LOGGER.info("Wallet collection completed with %s wallets", len(wallets))
 
     results = analyze_wallets(
@@ -1020,8 +1356,10 @@ def main() -> None:
         period_days=args.period_days,
         max_wallets=args.max_wallets,
         use_subgraph=args.use_subgraph,
+        workers=workers,
+        request_interval_seconds=args.request_interval_seconds,
     )
-    LOGGER.info("Analysis completed for %s wallets", len(results))
+    LOGGER.info("Analysis completed with %s profitable candidate wallets", len(results))
 
 
 if __name__ == "__main__":
