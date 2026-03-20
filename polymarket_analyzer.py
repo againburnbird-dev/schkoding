@@ -841,11 +841,12 @@ def fetch_subgraph_wallets(
         return []
 
     query_fields = graphql_introspect_query_fields(url, http_cache_dir, request_interval_seconds)
-    wallet_fields = ["user", "owner", "account", "proxyWallet", "maker", "taker"]
+    wallet_field_candidates = ["user", "owner", "account", "proxyWallet", "maker", "taker"]
     entity_name = None
     query = ""
+    selected_wallet_fields: List[str] = []
 
-    def build_query(root_name: str) -> str:
+    def build_query(root_name: str, wallet_fields: List[str]) -> str:
         requested_fields = "\n        ".join(wallet_fields)
         return f"""
         query ScanEntity($first: Int!, $skip: Int!) {{
@@ -861,7 +862,22 @@ def fetch_subgraph_wallets(
         """
 
     for candidate in entity_candidates:
-        candidate_query = build_query(candidate)
+        type_name = query_fields.get(candidate, "")
+        type_fields = (
+            graphql_introspect_type_fields(url, type_name, http_cache_dir, request_interval_seconds)
+            if type_name
+            else []
+        )
+        wallet_fields = [field for field in wallet_field_candidates if field in type_fields]
+        if not wallet_fields:
+            if "order" in candidate.lower():
+                wallet_fields = [field for field in ("maker", "taker") if field in type_fields]
+            elif "position" in candidate.lower() or "balance" in candidate.lower():
+                wallet_fields = [field for field in ("user", "proxyWallet") if field in type_fields]
+        if not wallet_fields:
+            continue
+
+        candidate_query = build_query(candidate, wallet_fields)
         payload = graphql_query(
             url,
             candidate_query,
@@ -874,6 +890,7 @@ def fetch_subgraph_wallets(
         if isinstance(rows, list):
             entity_name = candidate
             query = candidate_query
+            selected_wallet_fields = wallet_fields
             break
 
     if not entity_name:
@@ -894,7 +911,7 @@ def fetch_subgraph_wallets(
         if not rows:
             break
         for row in rows:
-            for field_name in wallet_fields:
+            for field_name in selected_wallet_fields:
                 wallet = normalize_wallet(row.get(field_name))
                 if wallet:
                     wallets.add(wallet)
