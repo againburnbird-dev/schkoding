@@ -149,7 +149,7 @@ def load_json(path: str, default: Any = None) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, MemoryError):
         return default
 
 
@@ -480,27 +480,131 @@ def graphql_query(
     return payload
 
 
+def graphql_introspect_query_fields(
+    url: str,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> Dict[str, str]:
+    """Return a mapping of query field name -> item type name for a subgraph endpoint."""
+    query = """
+    query IntrospectQueryFields {
+      __schema {
+        queryType {
+          fields {
+            name
+            type {
+              name
+              kind
+              ofType {
+                name
+                kind
+                ofType {
+                  name
+                  kind
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    payload = graphql_query(
+        url,
+        query,
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=24 * 60 * 60,
+        request_interval_seconds=request_interval_seconds,
+    )
+    result: Dict[str, str] = {}
+    fields = payload.get("data", {}).get("__schema", {}).get("queryType", {}).get("fields", [])
+    for field in fields:
+        type_info = field.get("type") or {}
+        item_type = (
+            type_info.get("name")
+            or (type_info.get("ofType") or {}).get("name")
+            or ((type_info.get("ofType") or {}).get("ofType") or {}).get("name")
+        )
+        if field.get("name") and item_type:
+            result[str(field["name"])] = str(item_type)
+    return result
+
+
+def graphql_introspect_type_fields(
+    url: str,
+    type_name: str,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[str]:
+    """Return field names for a GraphQL object type."""
+    query = """
+    query IntrospectType($typeName: String!) {
+      __type(name: $typeName) {
+        fields {
+          name
+        }
+      }
+    }
+    """
+    payload = graphql_query(
+        url,
+        query,
+        {"typeName": type_name},
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=24 * 60 * 60,
+        request_interval_seconds=request_interval_seconds,
+    )
+    return [
+        item.get("name")
+        for item in payload.get("data", {}).get("__type", {}).get("fields", [])
+        if item.get("name")
+    ]
+
+
 # =========================
 # Market cache and lookup
 # =========================
+def market_cache_dir(cache_dir: str) -> str:
+    """Return the sharded market cache directory."""
+    return ensure_dir(os.path.join(cache_dir, "market_objects"))
+
+
 def get_market_cache(cache_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Load the persisted market cache if it is fresh enough."""
-    cache_path = os.path.join(cache_dir, "markets.json")
-    cached = load_json(cache_path, default={})
-    if not isinstance(cached, dict):
-        return {}
-    fetched_at = parse_int(cached.get("fetched_at"))
-    if fetched_at and epoch_now() - fetched_at <= MARKET_CACHE_MAX_AGE_SECONDS:
-        markets = cached.get("markets")
-        return markets if isinstance(markets, dict) else {}
+    """Keep only an in-memory per-run market cache to avoid loading oversized monolithic files."""
+    legacy_cache_path = os.path.join(cache_dir, "markets.json")
+    if os.path.exists(legacy_cache_path):
+        LOGGER.warning(
+            "Legacy market cache detected at %s; it will be ignored in favor of sharded on-demand cache files.",
+            legacy_cache_path,
+        )
     return {}
 
 
+def load_market_cache_entries(cache_dir: str, condition_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Load sharded cached market records for a set of condition IDs."""
+    base_dir = market_cache_dir(cache_dir)
+    loaded: Dict[str, Dict[str, Any]] = {}
+    for condition_id in condition_ids:
+        normalized = str(condition_id)
+        cache_path = os.path.join(base_dir, f"{normalized}.json")
+        cached = load_json(cache_path, default={})
+        if not isinstance(cached, dict):
+            continue
+        fetched_at = parse_int(cached.get("fetched_at"))
+        if fetched_at and epoch_now() - fetched_at <= MARKET_CACHE_MAX_AGE_SECONDS:
+            market = cached.get("market")
+            if isinstance(market, dict):
+                loaded[normalized] = market
+    return loaded
+
+
 def save_market_cache(cache_dir: str, markets: Dict[str, Dict[str, Any]]) -> None:
-    """Save the on-demand market cache."""
-    cache_path = os.path.join(cache_dir, "markets.json")
+    """Persist market records as individual sharded JSON files."""
+    base_dir = market_cache_dir(cache_dir)
     with CACHE_WRITE_LOCK:
-        save_json(cache_path, {"fetched_at": epoch_now(), "markets": markets})
+        for condition_id, market in markets.items():
+            cache_path = os.path.join(base_dir, f"{condition_id}.json")
+            save_json(cache_path, {"fetched_at": epoch_now(), "market": market})
 
 
 def build_market_record(market: Dict[str, Any]) -> Dict[str, Any]:
@@ -693,8 +797,7 @@ def fetch_closed_positions(wallet: str, http_cache_dir: str, request_interval_se
 # =========================
 def fetch_subgraph_wallets(
     url: str,
-    entity: str,
-    field_names: List[str],
+    entity_candidates: List[str],
     max_pages: int,
     http_cache_dir: str,
     request_interval_seconds: float,
@@ -703,10 +806,23 @@ def fetch_subgraph_wallets(
     if max_pages <= 0:
         return []
 
-    requested_fields = "\n        ".join(field_names)
+    query_fields = graphql_introspect_query_fields(url, http_cache_dir, request_interval_seconds)
+    entity_name = next((name for name in entity_candidates if name in query_fields), None)
+    if not entity_name:
+        LOGGER.warning("No supported query root found for %s. Available fields: %s", url, sorted(query_fields))
+        return []
+
+    type_name = query_fields.get(entity_name, "")
+    field_names = graphql_introspect_type_fields(url, type_name, http_cache_dir, request_interval_seconds) if type_name else []
+    wallet_fields = [name for name in ("user", "owner", "account", "proxyWallet", "maker", "taker") if name in field_names]
+    if not wallet_fields:
+        LOGGER.warning("No wallet-like fields found for %s.%s", url, entity_name)
+        return []
+
+    requested_fields = "\n        ".join(wallet_fields)
     query = f"""
     query ScanEntity($first: Int!, $skip: Int!) {{
-      {entity}(
+      {entity_name}(
         first: $first
         skip: $skip
         orderBy: id
@@ -718,7 +834,7 @@ def fetch_subgraph_wallets(
     """
 
     wallets = set()
-    for page_index in tqdm(range(max_pages), desc=f"Subgraph {entity}"):
+    for page_index in tqdm(range(max_pages), desc=f"Subgraph {entity_name}"):
         payload = graphql_query(
             url,
             query,
@@ -727,11 +843,11 @@ def fetch_subgraph_wallets(
             cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
             request_interval_seconds=request_interval_seconds,
         )
-        rows = payload.get("data", {}).get(entity, []) if isinstance(payload, dict) else []
+        rows = payload.get("data", {}).get(entity_name, []) if isinstance(payload, dict) else []
         if not rows:
             break
         for row in rows:
-            for field_name in field_names:
+            for field_name in wallet_fields:
                 wallet = normalize_wallet(row.get(field_name))
                 if wallet:
                     wallets.add(wallet)
@@ -880,15 +996,14 @@ def collect_wallets(
                 break
 
         subgraph_sources = [
-            (ORDERBOOK_SUBGRAPH_URL, "orders", ["user"]),
-            (PNL_SUBGRAPH_URL, "pnls", ["user"]),
-            (POSITIONS_SUBGRAPH_URL, "positions", ["user"]),
+            (ORDERBOOK_SUBGRAPH_URL, "orderbook", ["orderFilledEvents", "ordersMatchedEvents", "marketDatas"]),
+            (PNL_SUBGRAPH_URL, "pnl", ["userPositions"]),
+            (POSITIONS_SUBGRAPH_URL, "positions", ["userBalances", "netUserBalances", "positions"]),
         ]
-        for url, entity, field_names in subgraph_sources:
+        for url, label, entity_candidates in subgraph_sources:
             discovered = fetch_subgraph_wallets(
                 url,
-                entity,
-                field_names,
+                entity_candidates,
                 subgraph_wallet_pages,
                 http_cache_dir,
                 request_interval_seconds,
@@ -898,8 +1013,8 @@ def collect_wallets(
                 if wallet not in wallets_map:
                     wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
                     added += 1
-            source_counts[f"subgraph_{entity}"] = added
-            LOGGER.info("Added %s wallets from %s subgraph scan", added, entity)
+            source_counts[f"subgraph_{label}"] = added
+            LOGGER.info("Added %s wallets from %s subgraph scan", added, label)
 
     wallets = [item for item in wallets_map.values() if normalize_wallet(item.get("wallet"))]
     wallets.sort(
@@ -1057,8 +1172,10 @@ def analyze_wallet(
         else fetch_wallet_trades(wallet, cutoff_ts, http_cache_dir, request_interval_seconds)
     )
     closed_positions = [] if use_subgraph else fetch_closed_positions(wallet, http_cache_dir, request_interval_seconds)
-    pnl_subgraph = fetch_wallet_pnl_subgraph(wallet, http_cache_dir, request_interval_seconds)
-    positions_subgraph = fetch_wallet_positions_subgraph(wallet, http_cache_dir, request_interval_seconds)
+    pnl_subgraph = fetch_wallet_pnl_subgraph(wallet, http_cache_dir, request_interval_seconds) if use_subgraph else []
+    positions_subgraph = (
+        fetch_wallet_positions_subgraph(wallet, http_cache_dir, request_interval_seconds) if use_subgraph else []
+    )
 
     realized_pnl_map = sum_realized_pnl(closed_positions)
     for pnl_map in (sum_realized_pnl(pnl_subgraph), sum_realized_pnl(positions_subgraph)):
@@ -1083,6 +1200,12 @@ def analyze_wallet(
         for condition_id in trades_by_market:
             if condition_id not in markets_cache:
                 missing_condition_ids.append(condition_id)
+        disk_cached_markets = load_market_cache_entries(cache_dir, missing_condition_ids)
+        if disk_cached_markets:
+            markets_cache.update(disk_cached_markets)
+            missing_condition_ids = [
+                condition_id for condition_id in missing_condition_ids if condition_id not in disk_cached_markets
+            ]
 
     if missing_condition_ids:
         fetched_markets = fetch_markets_by_condition_ids(
