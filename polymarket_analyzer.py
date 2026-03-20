@@ -60,7 +60,7 @@ GRAPHQL_HEADERS = {
 
 RETRY_BACKOFF_SECONDS = [1, 5, 10]
 REQUEST_SLEEP_RANGE = (0.6, 1.0)
-NON_RETRYABLE_HTTP_STATUS = {400, 401, 403, 404}
+NON_RETRYABLE_HTTP_STATUS = {400, 401, 403, 404, 422}
 
 LEADERBOARD_CATEGORY = "OVERALL"
 LEADERBOARD_TIME_PERIODS = ["ALL", "MONTH", "WEEK", "DAY"]
@@ -73,8 +73,8 @@ TRADES_PAGE_LIMIT = 500
 TRADES_MAX_OFFSET = 1000
 CLOSED_POSITIONS_PAGE_LIMIT = 50
 CLOSED_POSITIONS_MAX_OFFSET = 100000
-MARKETS_PAGE_LIMIT = 500
 MARKETS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+MARKET_LOOKUP_CHUNK_SIZE = 50
 
 DEFAULT_MAX_WALLETS = 100
 DEFAULT_PERIOD_DAYS = 180
@@ -518,62 +518,40 @@ def build_market_record(market: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def gamma_fetch_markets_page(limit: int = MARKETS_PAGE_LIMIT, offset: int = 0) -> List[Dict[str, Any]]:
-    """Fetch one page of market metadata from Gamma API."""
-    params = {"limit": limit, "offset": offset}
-    payload = request_json_or_empty("GET", f"{GAMMA_API_BASE}/markets", params=params)
-    return unwrap_list_payload(payload, ("markets", "data", "results"))
-
-
 def fetch_all_markets(cache_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Fetch market metadata and cache it for one day."""
+    """Load the persisted on-demand market cache."""
     cached = get_market_cache(cache_dir)
     if cached:
-        LOGGER.info("Loaded %s market metadata entries from cache", len(cached))
-        return cached
-
-    markets: Dict[str, Dict[str, Any]] = {}
-    offset = 0
-    progress = tqdm(desc="Markets cache", unit="page")
-    while True:
-        page = gamma_fetch_markets_page(limit=MARKETS_PAGE_LIMIT, offset=offset)
-        if not page:
-            break
-        for market in page:
-            normalized = build_market_record(market)
-            identifiers = {
-                market.get("conditionId"),
-                market.get("id"),
-                market.get("questionID"),
-                market.get("slug"),
-            }
-            for identifier in identifiers:
-                if identifier:
-                    markets[str(identifier)] = normalized
-        offset += len(page)
-        progress.update(1)
-        if len(page) < MARKETS_PAGE_LIMIT:
-            break
-    progress.close()
-
-    if markets:
-        save_market_cache(cache_dir, markets)
-    LOGGER.info("Fetched %s market metadata entries", len(markets))
-    return markets
+        LOGGER.info("Loaded %s cached market metadata entries", len(cached))
+    return cached
 
 
-def fetch_market_details(identifier: str) -> Dict[str, Any]:
-    """Fetch market details using either direct market id or list filters."""
-    direct_payload = request_json_or_empty("GET", f"{GAMMA_API_BASE}/markets/{identifier}")
-    if isinstance(direct_payload, dict) and direct_payload:
-        return build_market_record(direct_payload)
+def chunked(values: List[str], chunk_size: int) -> Iterable[List[str]]:
+    """Yield fixed-size chunks from a list."""
+    for start in range(0, len(values), chunk_size):
+        yield values[start : start + chunk_size]
 
-    for params in ({"conditionId": identifier}, {"id": identifier}, {"slug": identifier}):
-        payload = request_json_or_empty("GET", f"{GAMMA_API_BASE}/markets", params=params)
+
+def fetch_markets_by_condition_ids(condition_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetch market metadata in batches using the documented `condition_ids` query parameter."""
+    unique_ids = sorted({str(item) for item in condition_ids if item})
+    if not unique_ids:
+        return {}
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for batch in chunked(unique_ids, MARKET_LOOKUP_CHUNK_SIZE):
+        payload = request_json_or_empty(
+            "GET",
+            f"{GAMMA_API_BASE}/markets",
+            params={"condition_ids": batch},
+        )
         rows = unwrap_list_payload(payload, ("markets", "data", "results"))
-        if rows:
-            return build_market_record(rows[0])
-    return {}
+        for market in rows:
+            normalized = build_market_record(market)
+            condition_id = normalized.get("condition_id")
+            if condition_id:
+                resolved[str(condition_id)] = normalized
+    return resolved
 
 
 # =========================
@@ -869,16 +847,21 @@ def analyze_wallet(
         if ts is not None:
             trade_timestamps.append(ts)
 
+    missing_condition_ids = [
+        condition_id for condition_id in trades_by_market if condition_id not in markets_cache
+    ]
+    if missing_condition_ids:
+        fetched_markets = fetch_markets_by_condition_ids(missing_condition_ids)
+        if fetched_markets:
+            markets_cache.update(fetched_markets)
+            save_market_cache(cache_dir, markets_cache)
+
     winning_markets = 0
     total_resolved_markets = 0
     market_rows: List[Dict[str, Any]] = []
 
     for condition_id, market_trades in trades_by_market.items():
         market_info = markets_cache.get(condition_id)
-        if not market_info:
-            market_info = fetch_market_details(condition_id)
-            if market_info:
-                markets_cache[condition_id] = market_info
         if not market_info:
             market_info = {
                 "condition_id": condition_id,
@@ -909,8 +892,6 @@ def analyze_wallet(
         else:
             market_row["is_win"] = None
         market_rows.append(market_row)
-
-    save_market_cache(cache_dir, markets_cache)
 
     total_pnl_usd = sum(realized_pnl_map.get(condition_id, 0.0) for condition_id in trades_by_market)
     active_days = len(
