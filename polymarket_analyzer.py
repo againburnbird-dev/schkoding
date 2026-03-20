@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -54,6 +55,7 @@ ORDERBOOK_SUBGRAPH_URL = (
     "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/"
     "subgraphs/orderbook-subgraph/0.0.1/gn"
 )
+DUNE_API_BASE = "https://api.dune.com/api/v1"
 
 DEFAULT_HEADERS = {
     "Accept": "application/json",
@@ -93,6 +95,17 @@ DEFAULT_PER_WORKER_MEMORY_MB = 256
 DEFAULT_HTTP_CACHE_TTL_SECONDS = 6 * 60 * 60
 MARKET_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 REPORT_FLUSH_EVERY = 25
+DEFAULT_RPC_BLOCK_CHUNK = 50000
+DEFAULT_RPC_START_BLOCK = 40000000
+ADDRESS_REGEX = re.compile(r"0x[a-fA-F0-9]{40}")
+
+POLYMARKET_CONTRACTS = {
+    "ctf_exchange": "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
+    "neg_risk_ctf_exchange": "0xc5d563a36ae78145c45a50134d48a1215220f80a",
+    "ctf": "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+    "polymarket_proxy_factory": "0xab45c5a4b0c941a2f231c04c3f49182e1a254052",
+    "gnosis_safe_factory": "0xaacfeea03eb1561c4e67d661e40682bd20e3541b",
+}
 
 LOGGER = logging.getLogger("polymarket_analyzer")
 HTTP_RATE_LOCK = threading.Lock()
@@ -329,6 +342,27 @@ def chunked(values: List[str], chunk_size: int) -> Iterable[List[str]]:
     """Yield fixed-size chunks from a list."""
     for start in range(0, len(values), chunk_size):
         yield values[start : start + chunk_size]
+
+
+def extract_wallets_from_text(value: Any) -> List[str]:
+    """Extract all wallet-looking addresses from arbitrary text."""
+    if value is None:
+        return []
+    return [match.group(0).lower() for match in ADDRESS_REGEX.finditer(str(value))]
+
+
+def extract_wallets_from_object(value: Any) -> List[str]:
+    """Recursively extract wallet-looking addresses from a nested object."""
+    found = set()
+    if isinstance(value, dict):
+        for nested in value.values():
+            found.update(extract_wallets_from_object(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(extract_wallets_from_object(nested))
+    else:
+        found.update(extract_wallets_from_text(value))
+    return sorted(found)
 
 
 # =========================
@@ -792,6 +826,23 @@ def fetch_closed_positions(wallet: str, http_cache_dir: str, request_interval_se
     return records
 
 
+def fetch_open_positions_page(
+    offset: int,
+    http_cache_dir: str,
+    request_interval_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Fetch one public positions page to discover additional wallets."""
+    payload = request_json_or_empty(
+        "GET",
+        f"{DATA_API_BASE}/positions",
+        params={"limit": CLOSED_POSITIONS_PAGE_LIMIT, "offset": offset},
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+        request_interval_seconds=request_interval_seconds,
+    )
+    return unwrap_list_payload(payload, ("positions", "data", "results"))
+
+
 # =========================
 # Subgraph discovery and fallback
 # =========================
@@ -960,6 +1011,94 @@ def fetch_wallet_positions_subgraph(wallet: str, http_cache_dir: str, request_in
     return payload.get("data", {}).get("positions", []) if isinstance(payload, dict) else []
 
 
+def fetch_dune_wallets(
+    http_cache_dir: str,
+    request_interval_seconds: float,
+    query_id: int,
+    api_key: str,
+) -> List[str]:
+    """Fetch wallet addresses from a Dune query result set."""
+    headers = {"X-Dune-API-Key": api_key}
+    payload = request_json_or_empty(
+        "GET",
+        f"{DUNE_API_BASE}/query/{query_id}/results",
+        headers=headers,
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=12 * 60 * 60,
+        request_interval_seconds=request_interval_seconds,
+    )
+    rows = payload.get("result", {}).get("rows", []) if isinstance(payload, dict) else []
+    wallets = set()
+    for row in rows:
+        wallets.update(extract_wallets_from_object(row))
+    return sorted(wallets)
+
+
+def rpc_call(
+    rpc_url: str,
+    method: str,
+    params: List[Any],
+    request_interval_seconds: float,
+) -> Any:
+    """Execute a JSON-RPC request against a Polygon node."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) % 10**9,
+        "method": method,
+        "params": params,
+    }
+    response = request_json_or_empty(
+        "POST",
+        rpc_url,
+        json_payload=payload,
+        headers={"Content-Type": "application/json"},
+        request_interval_seconds=request_interval_seconds,
+    )
+    if isinstance(response, dict) and response.get("error"):
+        LOGGER.error("RPC error for %s: %s", method, response["error"])
+    return response.get("result") if isinstance(response, dict) else None
+
+
+def scan_contract_logs_for_wallets(
+    rpc_url: str,
+    contract_addresses: Iterable[str],
+    from_block: int,
+    to_block: int,
+    block_chunk: int,
+    request_interval_seconds: float,
+) -> List[str]:
+    """Collect wallet addresses from raw logs and tx senders for Polymarket-related contracts."""
+    wallets = set()
+    normalized_addresses = [str(address).lower() for address in contract_addresses if address]
+    for start_block in tqdm(range(from_block, to_block + 1, block_chunk), desc="RPC log scan"):
+        end_block = min(start_block + block_chunk - 1, to_block)
+        logs = rpc_call(
+            rpc_url,
+            "eth_getLogs",
+            [
+                {
+                    "fromBlock": hex(start_block),
+                    "toBlock": hex(end_block),
+                    "address": normalized_addresses,
+                }
+            ],
+            request_interval_seconds,
+        )
+        if not isinstance(logs, list):
+            continue
+        tx_hashes = set()
+        for log in logs:
+            wallets.update(extract_wallets_from_object(log))
+            tx_hash = log.get("transactionHash")
+            if tx_hash:
+                tx_hashes.add(tx_hash)
+        for tx_hash in tx_hashes:
+            tx = rpc_call(rpc_url, "eth_getTransactionByHash", [tx_hash], request_interval_seconds)
+            if isinstance(tx, dict):
+                wallets.update(extract_wallets_from_object(tx))
+    return sorted(wallets)
+
+
 # =========================
 # Wallet collection
 # =========================
@@ -969,6 +1108,12 @@ def collect_wallets(
     subgraph_wallet_pages: int,
     http_cache_dir: str,
     request_interval_seconds: float,
+    dune_query_id: int,
+    dune_api_key: str,
+    polygon_rpc_url: str,
+    rpc_start_block: int,
+    rpc_end_block: int,
+    rpc_block_chunk: int,
 ) -> List[Dict[str, Any]]:
     """Collect the broadest possible wallet universe for downstream filtering."""
     source_counts: Dict[str, int] = defaultdict(int)
@@ -995,6 +1140,28 @@ def collect_wallets(
             if len(rows) < TRADES_PAGE_LIMIT:
                 break
 
+        for offset in tqdm(
+            range(0, CLOSED_POSITIONS_MAX_OFFSET + CLOSED_POSITIONS_PAGE_LIMIT, CLOSED_POSITIONS_PAGE_LIMIT),
+            desc="Public positions",
+        ):
+            rows = fetch_open_positions_page(offset, http_cache_dir, request_interval_seconds)
+            if not rows:
+                break
+            for row in rows:
+                for candidate in (
+                    row.get("proxyWallet"),
+                    row.get("wallet"),
+                    row.get("user"),
+                    row.get("owner"),
+                    row.get("address"),
+                ):
+                    wallet = normalize_wallet(candidate)
+                    if wallet and wallet not in wallets_map:
+                        wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                        source_counts["public_positions"] += 1
+            if len(rows) < CLOSED_POSITIONS_PAGE_LIMIT:
+                break
+
         subgraph_sources = [
             (ORDERBOOK_SUBGRAPH_URL, "orderbook", ["orderFilledEvents", "ordersMatchedEvents", "marketDatas"]),
             (PNL_SUBGRAPH_URL, "pnl", ["userPositions"]),
@@ -1015,6 +1182,39 @@ def collect_wallets(
                     added += 1
             source_counts[f"subgraph_{label}"] = added
             LOGGER.info("Added %s wallets from %s subgraph scan", added, label)
+
+        if dune_query_id > 0 and dune_api_key:
+            dune_wallets = fetch_dune_wallets(http_cache_dir, request_interval_seconds, dune_query_id, dune_api_key)
+            added = 0
+            for wallet in dune_wallets:
+                if wallet not in wallets_map:
+                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                    added += 1
+            source_counts["dune"] = added
+            LOGGER.info("Added %s wallets from Dune query %s", added, dune_query_id)
+
+        if polygon_rpc_url:
+            rpc_wallets = scan_contract_logs_for_wallets(
+                polygon_rpc_url,
+                [
+                    POLYMARKET_CONTRACTS["ctf_exchange"],
+                    POLYMARKET_CONTRACTS["neg_risk_ctf_exchange"],
+                    POLYMARKET_CONTRACTS["ctf"],
+                    POLYMARKET_CONTRACTS["polymarket_proxy_factory"],
+                    POLYMARKET_CONTRACTS["gnosis_safe_factory"],
+                ],
+                rpc_start_block,
+                rpc_end_block,
+                rpc_block_chunk,
+                request_interval_seconds,
+            )
+            added = 0
+            for wallet in rpc_wallets:
+                if wallet not in wallets_map:
+                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                    added += 1
+            source_counts["raw_rpc_logs"] = added
+            LOGGER.info("Added %s wallets from raw Polygon RPC log scan", added)
 
     wallets = [item for item in wallets_map.values() if normalize_wallet(item.get("wallet"))]
     wallets.sort(
@@ -1422,6 +1622,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per_worker_memory_mb", type=int, default=DEFAULT_PER_WORKER_MEMORY_MB)
     parser.add_argument("--subgraph_wallet_pages", type=int, default=DEFAULT_SUBGRAPH_WALLET_PAGES)
     parser.add_argument("--request_interval_seconds", type=float, default=DEFAULT_REQUEST_INTERVAL_SECONDS)
+    parser.add_argument("--dune_query_id", type=int, default=0)
+    parser.add_argument("--dune_api_key", type=str, default=os.getenv("DUNE_API_KEY", ""))
+    parser.add_argument("--polygon_rpc_url", type=str, default=os.getenv("POLYGON_RPC_URL", ""))
+    parser.add_argument("--rpc_start_block", type=int, default=DEFAULT_RPC_START_BLOCK)
+    parser.add_argument("--rpc_end_block", type=int, default=0, help="0 = latest block at runtime is not resolved automatically here; set explicitly for full scans")
+    parser.add_argument("--rpc_block_chunk", type=int, default=DEFAULT_RPC_BLOCK_CHUNK)
     return parser
 
 
@@ -1464,12 +1670,31 @@ def main() -> None:
         args.request_interval_seconds,
     )
 
+    effective_rpc_end_block = args.rpc_end_block
+    if args.polygon_rpc_url and effective_rpc_end_block <= 0:
+        latest_block_hex = rpc_call(
+            args.polygon_rpc_url,
+            "eth_blockNumber",
+            [],
+            args.request_interval_seconds,
+        )
+        if isinstance(latest_block_hex, str) and latest_block_hex.startswith("0x"):
+            effective_rpc_end_block = int(latest_block_hex, 16)
+        else:
+            effective_rpc_end_block = args.rpc_start_block
+
     wallets = collect_wallets(
         output_dir=output_dir,
         leaderboard_only=args.leaderboard_only,
         subgraph_wallet_pages=args.subgraph_wallet_pages,
         http_cache_dir=http_cache_dir,
         request_interval_seconds=args.request_interval_seconds,
+        dune_query_id=args.dune_query_id,
+        dune_api_key=args.dune_api_key,
+        polygon_rpc_url=args.polygon_rpc_url,
+        rpc_start_block=args.rpc_start_block,
+        rpc_end_block=effective_rpc_end_block,
+        rpc_block_chunk=args.rpc_block_chunk,
     )
     LOGGER.info("Wallet collection completed with %s wallets", len(wallets))
 
