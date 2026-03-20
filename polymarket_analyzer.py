@@ -38,9 +38,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from tqdm import tqdm
 
-# =========================
-# Constants and API config
-# =========================
+# CONFIGURATIO
+# All runtime knobs are centralized here for easier script control.
+ENABLE_SMART_WORKER_DETECT = False
+NUMBER_OF_WORKER = 20
+
 DATA_API_BASE = "https://data-api.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 POSITIONS_SUBGRAPH_URL = (
@@ -230,6 +232,8 @@ def choose_worker_count(
     """Pick a conservative thread count for network-bound work."""
     if requested_workers > 0:
         return max(1, requested_workers)
+    if not ENABLE_SMART_WORKER_DETECT:
+        return max(1, NUMBER_OF_WORKER)
 
     cpu_count = max(1, int(system_profile.get("cpu_count") or 1))
     cpu_based = max(1, int(math.floor(cpu_count * max_cpu_percent / 100.0)))
@@ -595,6 +599,12 @@ def graphql_introspect_type_fields(
     ]
 
 
+def guess_graphql_type_name_from_root(root_name: str) -> str:
+    """Best-effort conversion from a plural camelCase root to a singular PascalCase type name."""
+    normalized = root_name[:-1] if root_name.endswith("s") else root_name
+    return normalized[:1].upper() + normalized[1:]
+
+
 # =========================
 # Market cache and lookup
 # =========================
@@ -862,7 +872,7 @@ def fetch_subgraph_wallets(
         """
 
     for candidate in entity_candidates:
-        type_name = query_fields.get(candidate, "")
+        type_name = query_fields.get(candidate, "") or guess_graphql_type_name_from_root(candidate)
         type_fields = (
             graphql_introspect_type_fields(url, type_name, http_cache_dir, request_interval_seconds)
             if type_name
