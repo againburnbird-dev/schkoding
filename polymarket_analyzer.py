@@ -869,11 +869,18 @@ def fetch_subgraph_wallets(
             else []
         )
         wallet_fields = [field for field in wallet_field_candidates if field in type_fields]
-        if not wallet_fields:
+        if not wallet_fields and type_fields:
             if "order" in candidate.lower():
                 wallet_fields = [field for field in ("maker", "taker") if field in type_fields]
             elif "position" in candidate.lower() or "balance" in candidate.lower():
                 wallet_fields = [field for field in ("user", "proxyWallet") if field in type_fields]
+        if not wallet_fields:
+            if "order" in candidate.lower():
+                wallet_fields = ["maker", "taker"]
+            elif "position" in candidate.lower() or "balance" in candidate.lower():
+                wallet_fields = ["user", "proxyWallet"]
+            else:
+                wallet_fields = ["user"]
         if not wallet_fields:
             continue
 
